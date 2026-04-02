@@ -5,7 +5,7 @@ A type adaptor which allows protobuf generated types to be used as Pydantic mode
 ## Installation
 
 ```bash
-pip install protodantic
+uv add git+https://github.com/Tehsmash/protodantic
 ```
 
 ## Usage
