@@ -3,10 +3,23 @@
 from __future__ import annotations
 
 import datetime
+import enum
 from typing import Any, Dict, List, Optional, Type
 
 import pydantic
-from google.protobuf.descriptor import Descriptor, FieldDescriptor
+from pydantic import ConfigDict
+from pydantic.alias_generators import to_camel
+from google.protobuf.descriptor import Descriptor, EnumDescriptor, FieldDescriptor
+
+# google.api.field_behavior extension — value 2 means REQUIRED.
+_FIELD_BEHAVIOR_REQUIRED = 2
+
+try:
+    from google.api import field_behavior_pb2
+
+    _FIELD_BEHAVIOR_EXTENSION = field_behavior_pb2.field_behavior
+except Exception:
+    _FIELD_BEHAVIOR_EXTENSION = None
 
 _PROTO_SCALAR_TYPE_MAP: dict[int, type] = {
     FieldDescriptor.TYPE_DOUBLE: float,
@@ -20,17 +33,12 @@ _PROTO_SCALAR_TYPE_MAP: dict[int, type] = {
     FieldDescriptor.TYPE_STRING: str,
     FieldDescriptor.TYPE_BYTES: bytes,
     FieldDescriptor.TYPE_UINT32: int,
-    FieldDescriptor.TYPE_ENUM: int,
     FieldDescriptor.TYPE_SFIXED32: int,
     FieldDescriptor.TYPE_SFIXED64: int,
     FieldDescriptor.TYPE_SINT32: int,
     FieldDescriptor.TYPE_SINT64: int,
 }
 
-# Well-known types are mapped to Python equivalents before their descriptors
-# are walked. This is necessary to avoid infinite recursion: google.protobuf.Struct
-# and google.protobuf.Value are mutually recursive (Struct.fields is
-# map<string, Value>; Value has a struct_value: Struct field).
 _WELL_KNOWN_TYPE_MAP: dict[str, type] = {
     "google.protobuf.Struct": Dict[str, Any],
     "google.protobuf.Value": Any,
@@ -52,19 +60,53 @@ _WELL_KNOWN_TYPE_MAP: dict[str, type] = {
 }
 
 # Sentinel stored in the cache while a model is being built.
-# Encountering it during recursion means we have a user-defined cycle;
-# we break it by returning Any for the back-reference.
 _IN_PROGRESS = object()
+
+
+def _is_required(field: FieldDescriptor) -> bool:
+    """Check if a field has google.api.field_behavior REQUIRED annotation."""
+    if _FIELD_BEHAVIOR_EXTENSION is None:
+        return False
+    try:
+        behaviors = field.GetOptions().Extensions[_FIELD_BEHAVIOR_EXTENSION]
+        return _FIELD_BEHAVIOR_REQUIRED in behaviors
+    except Exception:
+        return False
+
+
+def _enum_from_descriptor(
+    enum_desc: EnumDescriptor,
+    cache: dict[str, Any],
+) -> type:
+    """Create a StrEnum from a protobuf EnumDescriptor.
+
+    Values are the SCREAMING_SNAKE_CASE names (e.g. ``ROLE_USER``),
+    matching ProtoJSON enum serialisation conventions.
+    """
+    full_name = enum_desc.full_name
+    cached = cache.get(full_name)
+    if cached is not None:
+        return cached
+
+    members = {v.name: v.name for v in enum_desc.values}
+    str_enum = enum.StrEnum(enum_desc.name, members)
+    cache[full_name] = str_enum
+    return str_enum
 
 
 def model_from_proto(proto_cls: Type) -> Type[pydantic.BaseModel]:
     """Convert a protobuf message class to a Pydantic model.
 
     Recursively converts nested message types, repeated fields, and map fields.
-    All fields are optional with a default of None, matching proto3 semantics.
 
-    Well-known types (google.protobuf.Struct, Timestamp, etc.) are mapped to
-    their natural Python equivalents rather than being walked as descriptors.
+    Features:
+    - ProtoJSON compatible: camelCase aliases via ``alias_generator`` so models
+      accept both ``snake_case`` and ``camelCase`` field names.
+    - Required field detection: fields annotated with
+      ``google.api.field_behavior = REQUIRED`` become mandatory Pydantic fields.
+    - Enum support: proto enum fields become Python ``IntEnum`` types.
+    - Well-known types (google.protobuf.Struct, Timestamp, etc.) are mapped to
+      their natural Python equivalents.
 
     Args:
         proto_cls: A protobuf-generated message class (must have a DESCRIPTOR
@@ -73,15 +115,6 @@ def model_from_proto(proto_cls: Type) -> Type[pydantic.BaseModel]:
     Returns:
         A dynamically created ``pydantic.BaseModel`` subclass with equivalent
         fields.
-
-    Example::
-
-        from my_proto_pb2 import MyMessage
-        from protodantic import model_from_proto
-
-        MyModel = model_from_proto(MyMessage)
-        instance = MyModel(name="hello", value=42)
-        print(instance.model_dump())
     """
     return _model_from_descriptor(proto_cls.DESCRIPTOR, cache={})
 
@@ -92,33 +125,38 @@ def _model_from_descriptor(
 ) -> type:
     full_name = descriptor.full_name
 
-    # Intercept well-known types before walking their (potentially recursive) descriptors.
     if full_name in _WELL_KNOWN_TYPE_MAP:
         return _WELL_KNOWN_TYPE_MAP[full_name]
 
     cached = cache.get(full_name)
     if cached is _IN_PROGRESS:
-        # Cycle detected in user-defined messages: break it with Any.
         return Any
     if cached is not None:
         return cached
 
-    # Mark as in-progress before recursing into fields.
     cache[full_name] = _IN_PROGRESS
 
     field_definitions: dict[str, Any] = {}
     for field in descriptor.fields:
         python_type = _field_python_type(field, cache)
-        field_definitions[field.name] = (Optional[python_type], None)
+        if _is_required(field):
+            field_definitions[field.name] = (python_type, ...)
+        else:
+            field_definitions[field.name] = (Optional[python_type], None)
 
-    model = pydantic.create_model(descriptor.name, **field_definitions)
+    model = pydantic.create_model(
+        descriptor.name,
+        __config__=ConfigDict(
+            alias_generator=to_camel,
+            populate_by_name=True,
+        ),
+        **field_definitions,
+    )
     cache[full_name] = model
     return model
 
 
 def _field_python_type(field: FieldDescriptor, cache: dict[str, Any]) -> type:
-    # map<K, V> fields are represented as repeated synthetic message types
-    # with map_entry=true on their descriptor options.
     if (
         field.type == FieldDescriptor.TYPE_MESSAGE
         and field.message_type.GetOptions().map_entry
@@ -136,4 +174,6 @@ def _field_python_type(field: FieldDescriptor, cache: dict[str, Any]) -> type:
 def _resolve_type(field: FieldDescriptor, cache: dict[str, Any]) -> type:
     if field.type == FieldDescriptor.TYPE_MESSAGE:
         return _model_from_descriptor(field.message_type, cache)
+    if field.type == FieldDescriptor.TYPE_ENUM:
+        return _enum_from_descriptor(field.enum_type, cache)
     return _PROTO_SCALAR_TYPE_MAP.get(field.type, Any)

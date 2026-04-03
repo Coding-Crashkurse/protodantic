@@ -6,7 +6,7 @@ readme = "README.md"
 authors = [
     { name = "Sam Betts", email = "1769706+Tehsmash@users.noreply.github.com" }
 ]
-requires-python = ">=3.13"
+requires-python = ">=3.11"
 dependencies = [
     "protobuf>=7.34.1",
     "pydantic>=2.12.5",

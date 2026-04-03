@@ -1,6 +1,7 @@
 """Tests for protodantic.model_from_proto using a2a_pb2 types."""
 
 import datetime
+import enum
 from typing import Any, Union, get_args, get_origin
 
 import pydantic
@@ -46,11 +47,15 @@ class TestModelBasics:
         Model = model_from_proto(a2a_pb2.AuthenticationInfo)
         assert set(Model.model_fields) == {"scheme", "credentials"}
 
-    def test_all_fields_default_to_none(self):
-        # proto3 fields all have zero defaults; we represent this with None.
+    def test_optional_fields_default_to_none(self):
+        # Non-required proto3 fields default to None.
         Model = model_from_proto(a2a_pb2.AuthenticationInfo)
-        for name, field in Model.model_fields.items():
-            assert field.default is None, f"field '{name}' should default to None"
+        assert Model.model_fields["credentials"].default is None
+
+    def test_required_fields_have_no_default(self):
+        # Fields with google.api.field_behavior = REQUIRED are mandatory.
+        Model = model_from_proto(a2a_pb2.AuthenticationInfo)
+        assert Model.model_fields["scheme"].is_required()
 
     def test_independent_calls_produce_equivalent_field_sets(self):
         Model1 = model_from_proto(a2a_pb2.AuthenticationInfo)
@@ -81,10 +86,115 @@ class TestScalarFieldTypes:
         Model = model_from_proto(a2a_pb2.Part)
         assert _inner(Model, "raw") is bytes
 
-    def test_proto_enum_maps_to_int(self):
-        # TaskState is a proto enum; should become int.
+
+# ---------------------------------------------------------------------------
+# Enum field type mapping
+# ---------------------------------------------------------------------------
+
+class TestEnumFields:
+    def test_proto_enum_maps_to_str_enum(self):
         Model = model_from_proto(a2a_pb2.TaskStatus)
-        assert _inner(Model, "state") is int
+        inner = _inner(Model, "state")
+        assert issubclass(inner, enum.StrEnum)
+        assert inner.__name__ == "TaskState"
+
+    def test_enum_has_expected_members(self):
+        Model = model_from_proto(a2a_pb2.TaskStatus)
+        TaskState = _inner(Model, "state")
+        assert TaskState.TASK_STATE_UNSPECIFIED == "TASK_STATE_UNSPECIFIED"
+        assert TaskState.TASK_STATE_SUBMITTED == "TASK_STATE_SUBMITTED"
+        assert TaskState.TASK_STATE_WORKING == "TASK_STATE_WORKING"
+        assert TaskState.TASK_STATE_COMPLETED == "TASK_STATE_COMPLETED"
+
+    def test_role_enum(self):
+        Model = model_from_proto(a2a_pb2.Message)
+        Role = _inner(Model, "role")
+        assert issubclass(Role, enum.StrEnum)
+        assert Role.ROLE_USER == "ROLE_USER"
+        assert Role.ROLE_AGENT == "ROLE_AGENT"
+
+    def test_enum_value_accepted_by_model(self):
+        Model = model_from_proto(a2a_pb2.TaskStatus)
+        TaskState = _inner(Model, "state")
+        instance = Model(state=TaskState.TASK_STATE_WORKING)
+        assert instance.state == TaskState.TASK_STATE_WORKING
+
+    def test_enum_string_value_accepted(self):
+        Model = model_from_proto(a2a_pb2.TaskStatus)
+        instance = Model(state="TASK_STATE_WORKING")
+        assert instance.state == "TASK_STATE_WORKING"
+
+
+# ---------------------------------------------------------------------------
+# Required field validation
+# ---------------------------------------------------------------------------
+
+class TestRequiredFields:
+    def test_required_field_raises_on_missing(self):
+        Model = model_from_proto(a2a_pb2.Task)
+        with pytest.raises(pydantic.ValidationError):
+            Model()  # id and status are REQUIRED
+
+    def test_required_field_is_required(self):
+        Model = model_from_proto(a2a_pb2.Task)
+        assert Model.model_fields["id"].is_required()
+        assert Model.model_fields["status"].is_required()
+
+    def test_non_required_field_is_optional(self):
+        Model = model_from_proto(a2a_pb2.Task)
+        assert not Model.model_fields["context_id"].is_required()
+        assert Model.model_fields["context_id"].default is None
+
+    def test_message_required_fields(self):
+        Model = model_from_proto(a2a_pb2.Message)
+        assert Model.model_fields["message_id"].is_required()
+        assert Model.model_fields["role"].is_required()
+        assert Model.model_fields["parts"].is_required()
+        assert not Model.model_fields["context_id"].is_required()
+
+    def test_required_validation_catches_empty_input(self):
+        Model = model_from_proto(a2a_pb2.SendMessageRequest)
+        with pytest.raises(pydantic.ValidationError):
+            Model()  # message is REQUIRED
+
+
+# ---------------------------------------------------------------------------
+# ProtoJSON / camelCase alias support
+# ---------------------------------------------------------------------------
+
+class TestProtoJsonAliases:
+    def test_model_accepts_camel_case_keys(self):
+        Model = model_from_proto(a2a_pb2.AuthenticationInfo)
+        instance = Model.model_validate({"scheme": "Bearer", "credentials": "tok"})
+        assert instance.scheme == "Bearer"
+
+    def test_model_accepts_snake_case_keys(self):
+        Model = model_from_proto(a2a_pb2.SendMessageConfiguration)
+        instance = Model(accepted_output_modes=["text/plain"])
+        assert instance.accepted_output_modes == ["text/plain"]
+
+    def test_model_dump_by_alias_produces_camel_case(self):
+        Model = model_from_proto(a2a_pb2.SendMessageConfiguration)
+        instance = Model(accepted_output_modes=["text/plain"], return_immediately=True)
+        dumped = instance.model_dump(by_alias=True)
+        assert "acceptedOutputModes" in dumped
+        assert "returnImmediately" in dumped
+
+    def test_model_validate_camel_case_json(self):
+        Model = model_from_proto(a2a_pb2.TaskPushNotificationConfig)
+        data = {"url": "https://example.com", "taskId": "t-1"}
+        instance = Model.model_validate(data)
+        assert instance.task_id == "t-1"
+        assert instance.url == "https://example.com"
+
+    def test_roundtrip_camel_case(self):
+        Model = model_from_proto(a2a_pb2.AuthenticationInfo)
+        data = {"scheme": "Bearer", "credentials": "tok123"}
+        instance = Model.model_validate(data)
+        dumped = instance.model_dump(by_alias=True)
+        restored = Model.model_validate(dumped)
+        assert restored.scheme == "Bearer"
+        assert restored.credentials == "tok123"
 
 
 # ---------------------------------------------------------------------------
@@ -131,8 +241,6 @@ class TestNestedMessages:
         assert "parts" in MessageModel.model_fields
 
     def test_three_levels_of_nesting(self):
-        # SendMessageRequest -> configuration -> task_push_notification_config
-        #   -> authentication (AuthenticationInfo)
         Model = model_from_proto(a2a_pb2.SendMessageRequest)
         ConfigModel = _inner(Model, "configuration")
         PushModel = _inner(ConfigModel, "task_push_notification_config")
@@ -147,14 +255,12 @@ class TestNestedMessages:
 
 class TestMapFields:
     def test_map_str_str_becomes_dict_str_str(self):
-        # AuthorizationCodeOAuthFlow.scopes: map<string, string>
         Model = model_from_proto(a2a_pb2.AuthorizationCodeOAuthFlow)
         inner = _inner(Model, "scopes")
         assert get_origin(inner) is dict
         assert get_args(inner) == (str, str)
 
     def test_map_str_message_becomes_dict_str_model(self):
-        # AgentCard.security_schemes: map<string, SecurityScheme>
         Model = model_from_proto(a2a_pb2.AgentCard)
         inner = _inner(Model, "security_schemes")
         assert get_origin(inner) is dict
@@ -164,7 +270,6 @@ class TestMapFields:
         assert value_type.__name__ == "SecurityScheme"
 
     def test_map_str_list_message_becomes_dict_str_model(self):
-        # SecurityRequirement.schemes: map<string, StringList>
         Model = model_from_proto(a2a_pb2.SecurityRequirement)
         inner = _inner(Model, "schemes")
         assert get_origin(inner) is dict
@@ -175,12 +280,11 @@ class TestMapFields:
 
 
 # ---------------------------------------------------------------------------
-# Well-known type mapping (primary recursion regression tests)
+# Well-known type mapping
 # ---------------------------------------------------------------------------
 
 class TestWellKnownTypes:
     def test_struct_field_becomes_dict_str_any(self):
-        # Task.metadata: google.protobuf.Struct -> Dict[str, Any]
         Model = model_from_proto(a2a_pb2.Task)
         inner = _inner(Model, "metadata")
         assert get_origin(inner) is dict
@@ -189,25 +293,19 @@ class TestWellKnownTypes:
         assert value_type is Any
 
     def test_timestamp_field_becomes_datetime(self):
-        # TaskStatus.timestamp: google.protobuf.Timestamp -> datetime.datetime
         Model = model_from_proto(a2a_pb2.TaskStatus)
         assert _inner(Model, "timestamp") is datetime.datetime
 
     def test_no_recursion_error_from_struct_value_cycle(self):
-        # Struct -> fields map<string, Value>; Value -> struct_value: Struct
-        # Without the well-known type guard this causes infinite recursion.
-        Model = model_from_proto(a2a_pb2.AgentExtension)  # has params: Struct
+        Model = model_from_proto(a2a_pb2.AgentExtension)
         assert "params" in Model.model_fields
 
     def test_no_recursion_error_on_send_message_request(self):
-        # Regression test: SendMessageRequest.metadata is Struct;
-        # Message.metadata is also Struct.
         Model = model_from_proto(a2a_pb2.SendMessageRequest)
         assert Model is not None
         assert "metadata" in Model.model_fields
 
     def test_no_recursion_error_on_agent_card(self):
-        # AgentCard has Struct fields several levels deep.
         Model = model_from_proto(a2a_pb2.AgentCard)
         assert Model is not None
 
@@ -217,13 +315,13 @@ class TestWellKnownTypes:
 # ---------------------------------------------------------------------------
 
 class TestModelUsability:
-    def test_empty_instantiation(self):
+    def test_instantiation_with_required_fields_only(self):
         Model = model_from_proto(a2a_pb2.AuthenticationInfo)
-        instance = Model()
-        assert instance.scheme is None
+        instance = Model(scheme="Bearer")
+        assert instance.scheme == "Bearer"
         assert instance.credentials is None
 
-    def test_instantiation_with_values(self):
+    def test_instantiation_with_all_fields(self):
         Model = model_from_proto(a2a_pb2.AuthenticationInfo)
         instance = Model(scheme="Bearer", credentials="tok123")
         assert instance.scheme == "Bearer"
@@ -250,14 +348,12 @@ class TestModelUsability:
 
     def test_nested_model_instantiation(self):
         TaskStatusModel = model_from_proto(a2a_pb2.TaskStatus)
-        instance = TaskStatusModel(state=1)
-        assert instance.state == 1
+        instance = TaskStatusModel(state="TASK_STATE_WORKING")
+        assert instance.state == "TASK_STATE_WORKING"
         assert instance.message is None
         assert instance.timestamp is None
 
     def test_complex_model_json_schema_does_not_raise(self):
-        # Ensures schema generation works end-to-end for a complex, deeply
-        # nested proto with maps, repeated fields, and well-known types.
         Model = model_from_proto(a2a_pb2.AgentCard)
         schema = Model.model_json_schema()
         assert "properties" in schema
